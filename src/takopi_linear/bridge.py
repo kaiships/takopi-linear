@@ -132,23 +132,20 @@ def _activity_from_message(message: RenderedMessage, *, default_type: AgentActiv
         action = message.extra.get("action")
         parameter = message.extra.get("parameter")
         result = message.extra.get("result")
-        content: dict[str, Any] = {"type": "action", "action": {}}
-        if isinstance(action, str):
-            content["action"]["action"] = action
-        if isinstance(parameter, str):
-            content["action"]["parameter"] = parameter
-        if isinstance(result, str):
-            content["action"]["result"] = result
-        if not content["action"]:
-            content["action"] = {"action": "message", "parameter": message.text}
+        content: dict[str, Any] = {"type": "action"}
+        if isinstance(action, str) and action.strip():
+            content["action"] = action.strip()
+        if isinstance(parameter, str) and parameter.strip():
+            content["parameter"] = parameter.strip()
+        if isinstance(result, str) and result.strip():
+            content["result"] = result.strip()
+        if "action" not in content:
+            content["action"] = "message"
+        if "parameter" not in content and message.text.strip():
+            content["parameter"] = message.text.strip()
         return _ActivitySpec(type=activity_type, content=content, ephemeral=ephemeral)
 
-    content = {
-        "type": activity_type,
-        activity_type: {
-            "body": message.text,
-        },
-    }
+    content = {"type": activity_type, "body": message.text}
     return _ActivitySpec(type=activity_type, content=content, ephemeral=ephemeral)
 
 
