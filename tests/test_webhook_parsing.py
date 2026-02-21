@@ -13,6 +13,10 @@ def test_normalizes_agent_session_event_types() -> None:
     assert _normalize_event_type("AgentSessionEvent", "created") == "agent_session.created"
     assert _normalize_event_type("agentsessionevent.created", None) == "agent_session.created"
     assert _normalize_event_type("agentsessionevent.prompted", None) == "agent_session.prompted"
+    assert _normalize_event_type("AgentSessionEvent", "stopped") == "agent_session.stopped"
+    assert _normalize_event_type("agentsessionevent.stopped", None) == "agent_session.stopped"
+    assert _normalize_event_type("AgentSessionEvent", "cancelled") == "agent_session.cancelled"
+    assert _normalize_event_type("AgentSessionEvent", "canceled") == "agent_session.canceled"
 
 
 def test_extracts_agent_session_created_fields() -> None:

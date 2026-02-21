@@ -56,6 +56,7 @@ class GatewayPoller:
         self._source = source
         self._batch_size = int(batch_size)
         self._sleep = sleep
+        self._lock = anyio.Lock()
         self._conn: Any | None = conn
         self._own_conn = conn is None
 
@@ -83,13 +84,14 @@ class GatewayPoller:
         await self.close()
 
     async def poll(self) -> list[GatewayEvent]:
-        if self._conn is None:
-            await self.open()
-        conn = cast(Any, self._conn)
-        async with conn.cursor() as cur:
-            await cur.execute(_CLAIM_SQL, (self._source, self._batch_size))
-            rows = await cur.fetchall()
-        await conn.commit()
+        async with self._lock:
+            if self._conn is None:
+                await self.open()
+            conn = cast(Any, self._conn)
+            async with conn.cursor() as cur:
+                await cur.execute(_CLAIM_SQL, (self._source, self._batch_size))
+                rows = await cur.fetchall()
+            await conn.commit()
         events: list[GatewayEvent] = []
         for row in rows or []:
             if not isinstance(row, dict):
@@ -110,20 +112,22 @@ class GatewayPoller:
         return events
 
     async def mark_done(self, event_id: str) -> None:
-        if self._conn is None:
-            await self.open()
-        conn = cast(Any, self._conn)
-        async with conn.cursor() as cur:
-            await cur.execute(_DONE_SQL, (event_id,))
-        await conn.commit()
+        async with self._lock:
+            if self._conn is None:
+                await self.open()
+            conn = cast(Any, self._conn)
+            async with conn.cursor() as cur:
+                await cur.execute(_DONE_SQL, (event_id,))
+            await conn.commit()
 
     async def mark_failed(self, event_id: str, *, error: str) -> None:
-        if self._conn is None:
-            await self.open()
-        conn = cast(Any, self._conn)
-        async with conn.cursor() as cur:
-            await cur.execute(_FAILED_SQL, (error, event_id))
-        await conn.commit()
+        async with self._lock:
+            if self._conn is None:
+                await self.open()
+            conn = cast(Any, self._conn)
+            async with conn.cursor() as cur:
+                await cur.execute(_FAILED_SQL, (error, event_id))
+            await conn.commit()
 
     async def sleep(self, seconds: float) -> None:
         await self._sleep(seconds)
