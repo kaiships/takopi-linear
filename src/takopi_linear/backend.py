@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import shutil
 import json
 import re
-from dataclasses import dataclass
+import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
@@ -30,6 +30,12 @@ from .settings import LinearTransportSettings
 from .types import GatewayEvent, PlanStep
 
 logger = get_logger(__name__)
+
+_STOP_SESSION_EVENTS: set[str] = {
+    "agent_session.canceled",
+    "agent_session.cancelled",
+    "agent_session.stopped",
+}
 
 
 def _expect_settings(transport_config: object) -> LinearTransportSettings:
@@ -288,6 +294,16 @@ def _extract_prompt_body(payload: dict[str, Any]) -> str | None:
 class _SessionState:
     resume: ResumeToken | None = None
     context: RunContext | None = None
+    stop_requested: bool = False
+    run_lock: Any = field(default_factory=anyio.Lock)
+    running_tasks: RunningTasks = field(default_factory=dict)
+
+
+def _request_cancel(state: _SessionState) -> int:
+    tasks = list(state.running_tasks.values())
+    for task in tasks:
+        task.cancel_requested.set()
+    return len(tasks)
 
 
 async def _run_engine_for_session(
@@ -347,7 +363,7 @@ async def _run_engine_for_session(
     runner = _ResumeLineProxy(runner=runner)
 
     run_base_token = set_run_base_dir(cwd)
-    running_tasks: RunningTasks = {}
+    running_tasks = state.running_tasks
 
     async def on_thread_known(resume_token: ResumeToken, _done: anyio.Event) -> None:
         state.resume = resume_token
@@ -369,17 +385,34 @@ async def _run_engine_for_session(
             text=resolved.prompt,
         )
         context_line = runtime.format_context_line(context)
-        await handle_message(
-            exec_cfg,
-            runner=runner,
-            incoming=incoming,
-            resume_token=resume,
-            context=context,
-            context_line=context_line,
-            strip_resume_line=runtime.is_resume_line,
-            running_tasks=running_tasks,
-            on_thread_known=on_thread_known,
-        )
+        run_done = anyio.Event()
+
+        async def run_handle() -> None:
+            try:
+                await handle_message(
+                    exec_cfg,
+                    runner=runner,
+                    incoming=incoming,
+                    resume_token=resume,
+                    context=context,
+                    context_line=context_line,
+                    strip_resume_line=runtime.is_resume_line,
+                    running_tasks=running_tasks,
+                    on_thread_known=on_thread_known,
+                )
+            finally:
+                run_done.set()
+
+        async def watch_stop() -> None:
+            while not run_done.is_set():
+                if state.stop_requested:
+                    if _request_cancel(state):
+                        return
+                await anyio.sleep(0.05)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(watch_stop)
+            tg.start_soon(run_handle)
         state.context = context
     finally:
         reset_run_base_dir(run_base_token)
@@ -426,12 +459,9 @@ async def _run_loop(
     )
 
     async with poller:
-        while True:
-            events = await poller.poll()
-            if not events:
-                await poller.sleep(settings.poll_interval)
-                continue
-            for event in events:
+        async with anyio.create_task_group() as tg:
+
+            async def handle_and_mark(event: GatewayEvent) -> None:
                 try:
                     await _handle_event(
                         event=event,
@@ -443,7 +473,6 @@ async def _run_loop(
                         sessions=sessions,
                         default_engine_override=default_engine_override,
                     )
-                    await poller.mark_done(event.id)
                 except Exception as exc:
                     logger.exception(
                         "event.failed",
@@ -452,7 +481,32 @@ async def _run_loop(
                         error=str(exc),
                         error_type=exc.__class__.__name__,
                     )
-                    await poller.mark_failed(event.id, error=str(exc))
+                    try:
+                        await poller.mark_failed(event.id, error=str(exc))
+                    except Exception:
+                        logger.exception(
+                            "event.mark_failed_failed",
+                            event_id=event.id,
+                            event_type=event.event_type,
+                        )
+                    return
+
+                try:
+                    await poller.mark_done(event.id)
+                except Exception:
+                    logger.exception(
+                        "event.mark_done_failed",
+                        event_id=event.id,
+                        event_type=event.event_type,
+                    )
+
+            while True:
+                events = await poller.poll()
+                if not events:
+                    await poller.sleep(settings.poll_interval)
+                    continue
+                for event in events:
+                    tg.start_soon(handle_and_mark, event)
 
 
 async def _handle_event(
@@ -466,6 +520,7 @@ async def _handle_event(
     sessions: dict[str, _SessionState],
     default_engine_override: str | None,
 ) -> None:
+    _ = settings
     payload = _unwrap_payload(event.payload)
 
     event_type = event.event_type or payload.get("event_type") or payload.get("type")
@@ -473,7 +528,7 @@ async def _handle_event(
 
     normalized = _normalize_event_type(event_type, action)
 
-    if normalized not in {"agent_session.created", "agent_session.prompted"}:
+    if normalized not in {"agent_session.created", "agent_session.prompted", *_STOP_SESSION_EVENTS}:
         logger.debug("event.ignored", event_id=event.id, event_type=normalized)
         return
 
@@ -483,97 +538,135 @@ async def _handle_event(
 
     state = sessions.setdefault(session_id, _SessionState())
 
-    # Set a simple Agent Plan at session start (best-effort).
-    if normalized == "agent_session.created":
-        steps: list[PlanStep] = [
-            {"content": "Analyze request", "status": "inProgress"},
-            {"content": "Implement changes", "status": "pending"},
-            {"content": "Run tests", "status": "pending"},
-            {"content": "Summarize results", "status": "pending"},
-        ]
+    if normalized in _STOP_SESSION_EVENTS:
+        state.stop_requested = True
+        cancelled = _request_cancel(state)
+        run_in_flight = False
         try:
-            await client.set_agent_plan(session_id=session_id, steps=steps)
-        except (LinearApiError, Exception):
-            logger.debug("plan.set_failed", session_id=session_id)
+            run_in_flight = bool(state.run_lock.locked())
+        except Exception:
+            run_in_flight = False
 
-    issue_id: str | None = None
-    issue_from_api: dict[str, Any] | None = None
-
-    project_id = _extract_issue_project_id(payload)
-    issue_title = _extract_issue_title(payload) or _extract_issue_title_from_prompt_context(payload)
-
-    if normalized == "agent_session.created":
-        issue_id = _extract_issue_id(payload)
-        if issue_id is not None and (project_id is None or issue_title is None):
-            try:
-                issue_from_api = await client.get_issue(issue_id)
-            except LinearApiError:
-                issue_from_api = None
-
-        if project_id is None and issue_from_api is not None:
-            project = issue_from_api.get("project")
-            if isinstance(project, dict):
-                project_id = _coerce_text(project.get("id")) or project_id
-    if state.context is None and project_id and project_id in project_map:
-        state.context = RunContext(project=project_map[project_id], branch=None)
-
-    if normalized == "agent_session.created":
-        if issue_title is None and issue_from_api is not None:
-            issue_title = _coerce_text(issue_from_api.get("title")) or issue_title
-        prompt = issue_title or _extract_prompt_body(payload)
-    else:
-        prompt = _extract_prompt_body(payload)
-
-    if not prompt:
-        msg = (
-            "error:\nMissing prompt text in webhook payload. "
-            "Ensure kai-gateway forwards Linear's agentActivity body/content."
+        logger.info(
+            "session.stop_requested",
+            session_id=session_id,
+            cancelled_tasks=cancelled,
+            run_in_flight=run_in_flight,
+            event_id=event.id,
+            event_type=normalized,
         )
-        try:
+        if cancelled or run_in_flight:
             await exec_cfg.transport.send(
                 channel_id=session_id,
-                message=RenderedMessage(text=msg, extra={"activity_type": "error"}),
+                message=RenderedMessage(
+                    text="Stop requested. Cancelling…",
+                    extra={"activity_type": "thought", "ephemeral": True},
+                ),
             )
-        finally:
-            raise RuntimeError(f"Missing prompt text in event payload: {event.payload!r}")
+        return
 
-    bind_run_context(
-        event_id=event.id,
-        event_type=normalized,
-        session_id=session_id,
-    )
-    await exec_cfg.transport.send(
-        channel_id=session_id,
-        message=RenderedMessage(
-            text="Acknowledged. Starting…",
-            extra={"activity_type": "thought", "ephemeral": True},
-        ),
-    )
+    async with state.run_lock:
+        state.stop_requested = False
 
-    await _run_engine_for_session(
-        exec_cfg=exec_cfg,
-        runtime=runtime,
-        session_id=session_id,
-        user_msg_id=event.id,
-        text=prompt,
-        state=state,
-        default_engine_override=default_engine_override,
-    )
+        if normalized == "agent_session.created":
+            steps: list[PlanStep] = [
+                {"content": "Analyze request", "status": "inProgress"},
+                {"content": "Implement changes", "status": "pending"},
+                {"content": "Run tests", "status": "pending"},
+                {"content": "Summarize results", "status": "pending"},
+            ]
+            try:
+                await client.set_agent_plan(session_id=session_id, steps=steps)
+            except (LinearApiError, Exception):
+                logger.debug("plan.set_failed", session_id=session_id)
 
-    if normalized == "agent_session.created":
-        # Best-effort: mark plan completed at the end of the first run.
-        try:
-            await client.set_agent_plan(
+        issue_id: str | None = None
+        issue_from_api: dict[str, Any] | None = None
+
+        project_id = _extract_issue_project_id(payload)
+        issue_title = _extract_issue_title(payload) or _extract_issue_title_from_prompt_context(payload)
+
+        if normalized == "agent_session.created":
+            issue_id = _extract_issue_id(payload)
+            if issue_id is not None and (project_id is None or issue_title is None):
+                try:
+                    issue_from_api = await client.get_issue(issue_id)
+                except LinearApiError:
+                    issue_from_api = None
+
+            if project_id is None and issue_from_api is not None:
+                project = issue_from_api.get("project")
+                if isinstance(project, dict):
+                    project_id = _coerce_text(project.get("id")) or project_id
+
+        if state.context is None and project_id and project_id in project_map:
+            state.context = RunContext(project=project_map[project_id], branch=None)
+
+        if normalized == "agent_session.created":
+            if issue_title is None and issue_from_api is not None:
+                issue_title = _coerce_text(issue_from_api.get("title")) or issue_title
+            prompt = issue_title or _extract_prompt_body(payload)
+        else:
+            prompt = _extract_prompt_body(payload)
+
+        if not prompt:
+            msg = (
+                "error:\nMissing prompt text in webhook payload. "
+                "Ensure kai-gateway forwards Linear's agentActivity body/content."
+            )
+            try:
+                await exec_cfg.transport.send(
+                    channel_id=session_id,
+                    message=RenderedMessage(text=msg, extra={"activity_type": "error"}),
+                )
+            finally:
+                raise RuntimeError(f"Missing prompt text in event payload: {event.payload!r}")
+
+        bind_run_context(
+            event_id=event.id,
+            event_type=normalized,
+            session_id=session_id,
+        )
+        await exec_cfg.transport.send(
+            channel_id=session_id,
+            message=RenderedMessage(
+                text="Acknowledged. Starting…",
+                extra={"activity_type": "thought", "ephemeral": True},
+            ),
+        )
+
+        if state.stop_requested:
+            logger.info(
+                "session.stop_before_run",
                 session_id=session_id,
-                steps=[
-                    {"content": "Analyze request", "status": "completed"},
-                    {"content": "Implement changes", "status": "completed"},
-                    {"content": "Run tests", "status": "completed"},
-                    {"content": "Summarize results", "status": "completed"},
-                ],
+                event_id=event.id,
+                event_type=normalized,
             )
-        except (LinearApiError, Exception):
-            logger.debug("plan.finalize_failed", session_id=session_id)
+            return
+
+        await _run_engine_for_session(
+            exec_cfg=exec_cfg,
+            runtime=runtime,
+            session_id=session_id,
+            user_msg_id=event.id,
+            text=prompt,
+            state=state,
+            default_engine_override=default_engine_override,
+        )
+
+        if normalized == "agent_session.created" and not state.stop_requested:
+            try:
+                await client.set_agent_plan(
+                    session_id=session_id,
+                    steps=[
+                        {"content": "Analyze request", "status": "completed"},
+                        {"content": "Implement changes", "status": "completed"},
+                        {"content": "Run tests", "status": "completed"},
+                        {"content": "Summarize results", "status": "completed"},
+                    ],
+                )
+            except (LinearApiError, Exception):
+                logger.debug("plan.finalize_failed", session_id=session_id)
 
 
 class LinearBackend(TransportBackend):
