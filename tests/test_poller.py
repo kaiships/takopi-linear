@@ -65,10 +65,29 @@ async def test_poller_claims_and_commits() -> None:
 
 
 @pytest.mark.anyio
+async def test_poller_decodes_json_payload_strings() -> None:
+    conn = _FakeConn(
+        [
+            {
+                "id": "e1",
+                "source": "linear",
+                "event_type": "agent_session.prompted",
+                "external_id": None,
+                "payload": '{"agentSessionId": "sess_1", "agentActivity": {"body": "hi"}}',
+                "created_at": None,
+            }
+        ]
+    )
+    poller = GatewayPoller(database_url="postgresql://example", conn=conn)
+    events = await poller.poll()
+    assert events[0].payload["agentSessionId"] == "sess_1"
+    assert events[0].payload["agentActivity"]["body"] == "hi"
+
+
+@pytest.mark.anyio
 async def test_poller_marks_done_and_failed() -> None:
     conn = _FakeConn([])
     poller = GatewayPoller(database_url="postgresql://example", conn=conn)
     await poller.mark_done("e1")
     await poller.mark_failed("e2", error="boom")
     assert conn.commits == 2
-
