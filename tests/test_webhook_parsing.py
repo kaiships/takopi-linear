@@ -5,8 +5,14 @@ from takopi_linear.backend import (
     _extract_issue_title,
     _extract_prompt_body,
     _extract_session_id,
+    _normalize_event_type,
     _unwrap_payload,
 )
+
+def test_normalizes_agent_session_event_types() -> None:
+    assert _normalize_event_type("AgentSessionEvent", "created") == "agent_session.created"
+    assert _normalize_event_type("agentsessionevent.created", None) == "agent_session.created"
+    assert _normalize_event_type("agentsessionevent.prompted", None) == "agent_session.prompted"
 
 
 def test_extracts_agent_session_created_fields() -> None:
@@ -35,4 +41,3 @@ def test_extracts_prompted_body_from_agent_activity() -> None:
     raw = _unwrap_payload(payload)
     assert _extract_session_id(raw) == "sess_1"
     assert _extract_prompt_body(raw) == "please continue"
-
