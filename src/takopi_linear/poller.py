@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import json
 from typing import Any, cast
 
 import anyio
@@ -95,6 +96,16 @@ class GatewayPoller:
             if not isinstance(row, dict):
                 continue
             payload = row.get("payload")
+            if isinstance(payload, (bytes, bytearray)):
+                try:
+                    payload = payload.decode("utf-8")
+                except Exception:
+                    payload = {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    payload = {}
             if not isinstance(payload, dict):
                 payload = {}
             events.append(

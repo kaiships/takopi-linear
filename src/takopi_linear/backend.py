@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import shutil
+import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -95,10 +97,35 @@ def _load_linear_project_map(config_path: Path) -> dict[str, str]:
 
 
 def _unwrap_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    data = payload.get("data")
-    if isinstance(data, dict) and any(key in data for key in ("agentSession", "agentActivity", "promptContext")):
-        return data
-    return payload
+    """Normalize kai-gateway / Linear webhook payload wrappers.
+
+    Linear webhooks often wrap the event data under a top-level ``data`` key.
+    kai-gateway may also wrap the original webhook body under ``payload``.
+
+    We merge nested dict wrappers into a single dict so downstream extractors
+    can consistently look for ``agentSession`` / ``agentActivity`` fields.
+    """
+
+    out: dict[str, Any] = dict(payload or {})
+    for _ in range(6):
+        inner_payload = out.get("payload")
+        if isinstance(inner_payload, dict):
+            merged = dict(out)
+            merged.pop("payload", None)
+            merged.update(inner_payload)
+            out = merged
+            continue
+
+        data = out.get("data")
+        if isinstance(data, dict):
+            merged = dict(out)
+            merged.pop("data", None)
+            merged.update(data)
+            out = merged
+            continue
+
+        break
+    return out
 
 
 def _normalize_event_type(event_type: object, action: object) -> str:
@@ -118,12 +145,12 @@ def _normalize_event_type(event_type: object, action: object) -> str:
 
 
 def _extract_session_id(payload: dict[str, Any]) -> str | None:
-    agent_session = payload.get("agentSession")
+    agent_session = payload.get("agentSession") or payload.get("agent_session")
     if isinstance(agent_session, dict):
         sid = agent_session.get("id")
         if isinstance(sid, str) and sid:
             return sid
-    sid = payload.get("agentSessionId")
+    sid = payload.get("agentSessionId") or payload.get("agent_session_id")
     if isinstance(sid, str) and sid:
         return sid
     sid = payload.get("id")
@@ -133,7 +160,7 @@ def _extract_session_id(payload: dict[str, Any]) -> str | None:
 
 
 def _extract_issue_title(payload: dict[str, Any]) -> str | None:
-    agent_session = payload.get("agentSession")
+    agent_session = payload.get("agentSession") or payload.get("agent_session")
     if isinstance(agent_session, dict):
         issue = agent_session.get("issue")
         if isinstance(issue, dict):
@@ -145,11 +172,29 @@ def _extract_issue_title(payload: dict[str, Any]) -> str | None:
         title = issue.get("title")
         if isinstance(title, str) and title.strip():
             return title.strip()
+    title = payload.get("issueTitle") or payload.get("issue_title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    return None
+
+
+_PROMPT_CONTEXT_TITLE_RE = re.compile(r"<title>(?P<title>[^<]+)</title>", re.IGNORECASE)
+
+
+def _extract_issue_title_from_prompt_context(payload: dict[str, Any]) -> str | None:
+    prompt_context = payload.get("promptContext") or payload.get("prompt_context")
+    if not isinstance(prompt_context, str) or not prompt_context.strip():
+        return None
+    match = _PROMPT_CONTEXT_TITLE_RE.search(prompt_context)
+    if match:
+        title = match.group("title").strip()
+        if title:
+            return title
     return None
 
 
 def _extract_issue_project_id(payload: dict[str, Any]) -> str | None:
-    agent_session = payload.get("agentSession")
+    agent_session = payload.get("agentSession") or payload.get("agent_session")
     if isinstance(agent_session, dict):
         issue = agent_session.get("issue")
         if isinstance(issue, dict):
@@ -158,23 +203,84 @@ def _extract_issue_project_id(payload: dict[str, Any]) -> str | None:
                 pid = project.get("id")
                 if isinstance(pid, str) and pid.strip():
                     return pid.strip()
-            pid = issue.get("projectId")
+            pid = issue.get("projectId") or issue.get("project_id")
             if isinstance(pid, str) and pid.strip():
                 return pid.strip()
     return None
 
 
+def _extract_issue_id(payload: dict[str, Any]) -> str | None:
+    agent_session = payload.get("agentSession") or payload.get("agent_session")
+    if isinstance(agent_session, dict):
+        issue = agent_session.get("issue")
+        if isinstance(issue, dict):
+            iid = issue.get("id") or issue.get("issueId") or issue.get("issue_id")
+            if isinstance(iid, str) and iid.strip():
+                return iid.strip()
+    issue = payload.get("issue")
+    if isinstance(issue, dict):
+        iid = issue.get("id")
+        if isinstance(iid, str) and iid.strip():
+            return iid.strip()
+    iid = payload.get("issueId") or payload.get("issue_id")
+    if isinstance(iid, str) and iid.strip():
+        return iid.strip()
+    return None
+
+
+def _coerce_text(value: object) -> str | None:
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            return text
+    return None
+
+
+def _extract_activity_body(agent_activity: object) -> str | None:
+    if isinstance(agent_activity, str):
+        return _coerce_text(agent_activity)
+    if not isinstance(agent_activity, dict):
+        return None
+
+    body = _coerce_text(agent_activity.get("body"))
+    if body is not None:
+        return body
+
+    content: object = agent_activity.get("content")
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except json.JSONDecodeError:
+            content = None
+
+    if isinstance(content, dict):
+        body = _coerce_text(content.get("body")) or _coerce_text(content.get("text"))
+        if body is not None:
+            return body
+
+        action = _coerce_text(content.get("action"))
+        parameter = _coerce_text(content.get("parameter"))
+        if action == "message" and parameter is not None:
+            return parameter
+
+    return None
+
+
 def _extract_prompt_body(payload: dict[str, Any]) -> str | None:
     # For `prompted` session events, Linear includes the user's message in agentActivity.body.
-    agent_activity = payload.get("agentActivity")
-    if isinstance(agent_activity, dict):
-        body = agent_activity.get("body")
-        if isinstance(body, str) and body.strip():
-            return body.strip()
+    agent_activity = payload.get("agentActivity") or payload.get("agent_activity")
+    body = _extract_activity_body(agent_activity)
+    if body is not None:
+        return body
     # Fallbacks
-    body = payload.get("promptContext")
-    if isinstance(body, str) and body.strip():
-        return body.strip()
+    prompt_context = payload.get("promptContext") or payload.get("prompt_context")
+    body = _coerce_text(prompt_context)
+    if body is not None:
+        return body
+    if isinstance(prompt_context, dict):
+        body = _coerce_text(prompt_context.get("body")) or _coerce_text(prompt_context.get("text"))
+        if body is not None:
+            return body
     return None
 
 
@@ -390,14 +496,46 @@ async def _handle_event(
         except (LinearApiError, Exception):
             logger.debug("plan.set_failed", session_id=session_id)
 
+    issue_id: str | None = None
+    issue_from_api: dict[str, Any] | None = None
+
     project_id = _extract_issue_project_id(payload)
+    issue_title = _extract_issue_title(payload) or _extract_issue_title_from_prompt_context(payload)
+
+    if normalized == "agent_session.created":
+        issue_id = _extract_issue_id(payload)
+        if issue_id is not None and (project_id is None or issue_title is None):
+            try:
+                issue_from_api = await client.get_issue(issue_id)
+            except LinearApiError:
+                issue_from_api = None
+
+        if project_id is None and issue_from_api is not None:
+            project = issue_from_api.get("project")
+            if isinstance(project, dict):
+                project_id = _coerce_text(project.get("id")) or project_id
     if state.context is None and project_id and project_id in project_map:
         state.context = RunContext(project=project_map[project_id], branch=None)
 
     if normalized == "agent_session.created":
-        prompt = _extract_issue_title(payload) or _extract_prompt_body(payload) or "continue"
+        if issue_title is None and issue_from_api is not None:
+            issue_title = _coerce_text(issue_from_api.get("title")) or issue_title
+        prompt = issue_title or _extract_prompt_body(payload)
     else:
-        prompt = _extract_prompt_body(payload) or "continue"
+        prompt = _extract_prompt_body(payload)
+
+    if not prompt:
+        msg = (
+            "error:\nMissing prompt text in webhook payload. "
+            "Ensure kai-gateway forwards Linear's agentActivity body/content."
+        )
+        try:
+            await exec_cfg.transport.send(
+                channel_id=session_id,
+                message=RenderedMessage(text=msg, extra={"activity_type": "error"}),
+            )
+        finally:
+            raise RuntimeError(f"Missing prompt text in event payload: {event.payload!r}")
 
     bind_run_context(
         event_id=event.id,
