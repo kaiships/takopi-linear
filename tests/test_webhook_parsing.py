@@ -1,0 +1,38 @@
+from __future__ import annotations
+
+from takopi_linear.backend import (
+    _extract_issue_project_id,
+    _extract_issue_title,
+    _extract_prompt_body,
+    _extract_session_id,
+    _unwrap_payload,
+)
+
+
+def test_extracts_agent_session_created_fields() -> None:
+    payload = {
+        "type": "AgentSessionEvent",
+        "action": "created",
+        "agentSession": {
+            "id": "sess_1",
+            "issue": {"title": "@feat/auth Add JWT", "project": {"id": "proj_1"}},
+        },
+        "promptContext": "ignored",
+    }
+    raw = _unwrap_payload(payload)
+    assert _extract_session_id(raw) == "sess_1"
+    assert _extract_issue_title(raw) == "@feat/auth Add JWT"
+    assert _extract_issue_project_id(raw) == "proj_1"
+
+
+def test_extracts_prompted_body_from_agent_activity() -> None:
+    payload = {
+        "type": "AgentSessionEvent",
+        "action": "prompted",
+        "agentSession": {"id": "sess_1"},
+        "agentActivity": {"body": "please continue"},
+    }
+    raw = _unwrap_payload(payload)
+    assert _extract_session_id(raw) == "sess_1"
+    assert _extract_prompt_body(raw) == "please continue"
+

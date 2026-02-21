@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "takopi-linear"
+version = "0.1.0"
+description = "Takopi transport backend for Linear Agent SDK"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "anyio>=4.0",
+  "httpx>=0.27",
+  "pydantic>=2.0",
+  "psycopg[binary]>=3.2",
+  "takopi>=0.1",
+]
+
+[project.entry-points."takopi.transport_backends"]
+linear = "takopi_linear.backend:BACKEND"
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0",
+  "pytest-anyio>=0.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/takopi_linear"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
