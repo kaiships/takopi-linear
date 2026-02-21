@@ -219,9 +219,6 @@ class LinearClient:
             success
             agentActivity {
               id
-              type
-              body
-              createdAt
             }
           }
         }
