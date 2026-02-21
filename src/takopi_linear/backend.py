@@ -9,7 +9,7 @@ import anyio
 
 from takopi.backends import EngineBackend, SetupIssue
 from takopi.backends_helpers import install_issue
-from takopi.config import ConfigError, read_config, resolve_config_path
+from takopi.config import ConfigError, read_config
 from takopi.context import RunContext
 from takopi.logging import clear_context, get_logger, bind_run_context
 from takopi.model import ResumeToken
@@ -50,6 +50,18 @@ def _config_issue(path: Path, *, title: str) -> SetupIssue:
     return SetupIssue(title, (f"   {_display_path(path)}",))
 
 
+def _resolve_takopi_config_path() -> Path:
+    import takopi.config as takopi_config
+
+    resolver = getattr(takopi_config, "resolve_config_path", None)
+    if callable(resolver):
+        return cast(Path, resolver())
+    fallback = getattr(takopi_config, "HOME_CONFIG_PATH", None)
+    if isinstance(fallback, Path):
+        return fallback
+    return Path.home() / ".takopi" / "takopi.toml"
+
+
 def _load_linear_project_map(config_path: Path) -> dict[str, str]:
     """Return a mapping of Linear project id -> takopi project key (lowercase)."""
     try:
@@ -87,6 +99,22 @@ def _unwrap_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(data, dict) and any(key in data for key in ("agentSession", "agentActivity", "promptContext")):
         return data
     return payload
+
+
+def _normalize_event_type(event_type: object, action: object) -> str:
+    raw = str(event_type or "")
+    raw_lower = raw.lower()
+    action_lower = action.lower() if isinstance(action, str) else None
+
+    # Native Linear webhook format: { type: "AgentSessionEvent", action: "created" }.
+    if raw == "AgentSessionEvent" or raw_lower == "agentsessionevent":
+        return f"agent_session.{action_lower}" if action_lower else ""
+
+    # kai-gateway format: { event_type: "agentsessionevent.created" } (action already embedded).
+    if raw_lower.startswith("agentsessionevent."):
+        return "agent_session." + raw_lower.removeprefix("agentsessionevent.")
+
+    return raw_lower
 
 
 def _extract_session_id(payload: dict[str, Any]) -> str | None:
@@ -337,9 +365,7 @@ async def _handle_event(
     event_type = event.event_type or payload.get("event_type") or payload.get("type")
     action = payload.get("action")
 
-    normalized = str(event_type or "")
-    if normalized == "AgentSessionEvent":
-        normalized = f"agent_session.{action}" if isinstance(action, str) else ""
+    normalized = _normalize_event_type(event_type, action)
 
     if normalized not in {"agent_session.created", "agent_session.prompted"}:
         logger.debug("event.ignored", event_id=event.id, event_type=normalized)
@@ -423,7 +449,7 @@ class LinearBackend(TransportBackend):
         transport_override: str | None = None,
     ) -> SetupResult:
         issues: list[SetupIssue] = []
-        config_path = resolve_config_path()
+        config_path = _resolve_takopi_config_path()
 
         cmd = engine_backend.cli_cmd or engine_backend.id
         if shutil.which(cmd) is None:
