@@ -178,6 +178,48 @@ class LinearClient:
             raise LinearApiError("Missing agentActivity in response")
         return activity  # type: ignore[return-value]
 
+    async def get_agent_session_snapshot(
+        self,
+        session_id: str,
+        *,
+        activities_last: int = 10,
+    ) -> LinearAgentSession:
+        query = """
+        query AgentSessionSnapshot($id: String!, $last: Int!) {
+          agentSession(id: $id) {
+            id
+            status
+            type
+            createdAt
+            issue { id title identifier url project { id name } }
+            activities(last: $last) {
+              nodes {
+                id
+                createdAt
+                content {
+                  __typename
+                  ... on AgentActivityThoughtContent { body }
+                  ... on AgentActivityPromptContent { body }
+                  ... on AgentActivityElicitationContent { body }
+                  ... on AgentActivityResponseContent { body }
+                  ... on AgentActivityErrorContent { body }
+                  ... on AgentActivityActionContent { action parameter result }
+                }
+              }
+            }
+          }
+        }
+        """
+        data = await self.graphql(
+            query,
+            variables={"id": session_id, "last": int(activities_last)},
+            operation_name="AgentSessionSnapshot",
+        )
+        session = data.get("agentSession")
+        if not isinstance(session, dict):
+            raise LinearApiError("Missing agentSession in response")
+        return session  # type: ignore[return-value]
+
     async def update_issue(self, issue_id: str, **fields: Any) -> LinearIssue:
         query = """
         mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
@@ -281,7 +323,6 @@ class LinearClient:
             success
             agentSession {
               id
-              state
             }
           }
         }
