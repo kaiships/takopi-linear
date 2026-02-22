@@ -63,6 +63,28 @@ def test_extracts_prompted_body_from_agent_activity_content_body() -> None:
     assert _extract_prompt_body(raw) == "hello from content"
 
 
+def test_extracts_prompted_body_from_agent_activity_content_nested_message_body() -> None:
+    payload = {
+        "type": "AgentSessionEvent",
+        "action": "prompted",
+        "agentSession": {"id": "sess_1"},
+        "agentActivity": {"content": {"type": "message", "message": {"body": "hello nested"}}},
+    }
+    raw = _unwrap_payload(payload)
+    assert _extract_prompt_body(raw) == "hello nested"
+
+
+def test_extracts_prompted_body_from_agent_activity_content_json_string() -> None:
+    payload = {
+        "type": "AgentSessionEvent",
+        "action": "prompted",
+        "agentSession": {"id": "sess_1"},
+        "agentActivity": {"content": '{"type":"message","message":{"body":"hello json"}}'},
+    }
+    raw = _unwrap_payload(payload)
+    assert _extract_prompt_body(raw) == "hello json"
+
+
 def test_extracts_prompted_body_from_agent_activity_content_action_message_parameter() -> None:
     payload = {
         "type": "AgentSessionEvent",
@@ -72,6 +94,19 @@ def test_extracts_prompted_body_from_agent_activity_content_action_message_param
     }
     raw = _unwrap_payload(payload)
     assert _extract_prompt_body(raw) == "hello param"
+
+
+def test_extracts_prompted_body_from_agent_activity_content_nested_action_message_parameter() -> None:
+    payload = {
+        "type": "AgentSessionEvent",
+        "action": "prompted",
+        "agentSession": {"id": "sess_1"},
+        "agentActivity": {
+            "content": {"type": "action", "action": {"action": "message", "parameter": "hello nested param"}}
+        },
+    }
+    raw = _unwrap_payload(payload)
+    assert _extract_prompt_body(raw) == "hello nested param"
 
 
 def test_extracts_issue_title_from_prompt_context_title_tag() -> None:

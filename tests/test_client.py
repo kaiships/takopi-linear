@@ -72,6 +72,40 @@ async def test_create_agent_activity_includes_content_and_ephemeral() -> None:
 
 
 @pytest.mark.anyio
+async def test_get_agent_activity_fetches_content_body() -> None:
+    seen: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seen.update(body)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "agentActivity": {
+                        "id": "a1",
+                        "content": {"__typename": "AgentActivityPromptContent", "body": "hello"},
+                    }
+                }
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(transport=transport)
+    client = LinearClient("t", api_url="https://linear.test/graphql", http=http)
+    try:
+        activity = await client.get_agent_activity("a1")
+        assert activity["id"] == "a1"
+        assert activity["content"]["body"] == "hello"
+        assert seen.get("operationName") == "AgentActivity"
+        variables = seen.get("variables")
+        assert isinstance(variables, dict)
+        assert variables["id"] == "a1"
+    finally:
+        await http.aclose()
+
+
+@pytest.mark.anyio
 async def test_set_agent_plan_uses_agent_session_update() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
@@ -102,4 +136,3 @@ async def test_set_agent_plan_uses_agent_session_update() -> None:
         )
     finally:
         await http.aclose()
-
