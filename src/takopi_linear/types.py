@@ -49,6 +49,7 @@ class LinearAgentActivity(TypedDict, total=False):
     id: str
     type: str
     body: str
+    content: object
     createdAt: str
 
 
@@ -56,4 +57,3 @@ class LinearAgentSession(TypedDict, total=False):
     id: str
     state: str
     issue: LinearIssue | None
-

@@ -151,6 +151,33 @@ class LinearClient:
             raise LinearApiError("Missing issue in response")
         return issue  # type: ignore[return-value]
 
+    async def get_agent_activity(self, activity_id: str) -> LinearAgentActivity:
+        query = """
+        query AgentActivity($id: String!) {
+          agentActivity(id: $id) {
+            id
+            content {
+              __typename
+              ... on AgentActivityThoughtContent { body }
+              ... on AgentActivityPromptContent { body }
+              ... on AgentActivityElicitationContent { body }
+              ... on AgentActivityResponseContent { body }
+              ... on AgentActivityErrorContent { body }
+              ... on AgentActivityActionContent { action parameter result }
+            }
+          }
+        }
+        """
+        data = await self.graphql(
+            query,
+            variables={"id": activity_id},
+            operation_name="AgentActivity",
+        )
+        activity = data.get("agentActivity")
+        if not isinstance(activity, dict):
+            raise LinearApiError("Missing agentActivity in response")
+        return activity  # type: ignore[return-value]
+
     async def update_issue(self, issue_id: str, **fields: Any) -> LinearIssue:
         query = """
         mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {

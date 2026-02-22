@@ -242,6 +242,40 @@ def _coerce_text(value: object) -> str | None:
     return None
 
 
+def _extract_text_from_activity_content(content: dict[str, Any]) -> str | None:
+    body = _coerce_text(content.get("body")) or _coerce_text(content.get("text"))
+    if body is not None:
+        return body
+
+    # Linear SDK content payloads often nest the actual body under the content type,
+    # e.g. {"type": "message", "message": {"body": "..."} }.
+    for key in ("prompt", "message", "thought", "elicitation", "response", "error"):
+        nested = content.get(key)
+        if isinstance(nested, dict):
+            nested_body = _coerce_text(nested.get("body")) or _coerce_text(nested.get("text"))
+            if nested_body is not None:
+                return nested_body
+
+    action = content.get("action")
+    parameter = content.get("parameter")
+    if isinstance(action, dict):
+        nested_action = _coerce_text(action.get("action")) or _coerce_text(action.get("type"))
+        nested_parameter = (
+            _coerce_text(action.get("parameter"))
+            or _coerce_text(action.get("body"))
+            or _coerce_text(action.get("text"))
+        )
+        if nested_action == "message" and nested_parameter is not None:
+            return nested_parameter
+    else:
+        action_text = _coerce_text(action)
+        parameter_text = _coerce_text(parameter)
+        if action_text == "message" and parameter_text is not None:
+            return parameter_text
+
+    return None
+
+
 def _extract_activity_body(agent_activity: object) -> str | None:
     if isinstance(agent_activity, str):
         return _coerce_text(agent_activity)
@@ -260,14 +294,9 @@ def _extract_activity_body(agent_activity: object) -> str | None:
             content = None
 
     if isinstance(content, dict):
-        body = _coerce_text(content.get("body")) or _coerce_text(content.get("text"))
+        body = _extract_text_from_activity_content(content)
         if body is not None:
             return body
-
-        action = _coerce_text(content.get("action"))
-        parameter = _coerce_text(content.get("parameter"))
-        if action == "message" and parameter is not None:
-            return parameter
 
     return None
 
@@ -288,6 +317,31 @@ def _extract_prompt_body(payload: dict[str, Any]) -> str | None:
         if body is not None:
             return body
     return None
+
+
+def _extract_agent_activity_id(payload: dict[str, Any]) -> str | None:
+    agent_activity = payload.get("agentActivity") or payload.get("agent_activity")
+    if isinstance(agent_activity, dict):
+        aid = agent_activity.get("id") or agent_activity.get("agentActivityId") or agent_activity.get("agent_activity_id")
+        if isinstance(aid, str) and aid.strip():
+            return aid.strip()
+    aid = payload.get("agentActivityId") or payload.get("agent_activity_id")
+    if isinstance(aid, str) and aid.strip():
+        return aid.strip()
+    return None
+
+
+async def _maybe_fetch_prompt_from_linear(
+    payload: dict[str, Any], *, client: LinearClient
+) -> str | None:
+    activity_id = _extract_agent_activity_id(payload)
+    if not activity_id:
+        return None
+    try:
+        activity = await client.get_agent_activity(activity_id)
+    except LinearApiError:
+        return None
+    return _extract_activity_body(activity)
 
 
 @dataclass(slots=True)
@@ -608,6 +662,9 @@ async def _handle_event(
             prompt = issue_title or _extract_prompt_body(payload)
         else:
             prompt = _extract_prompt_body(payload)
+
+        if not prompt:
+            prompt = await _maybe_fetch_prompt_from_linear(payload, client=client)
 
         if not prompt:
             msg = (
