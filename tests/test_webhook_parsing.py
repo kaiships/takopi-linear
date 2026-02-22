@@ -127,3 +127,38 @@ def test_extracts_fields_with_snake_case_keys() -> None:
     assert _extract_session_id(raw) == "sess_1"
     assert _extract_issue_title(raw) == "Snake case title"
     assert _extract_issue_project_id(raw) == "proj_1"
+
+
+def test_extracts_fields_from_raw_payload_wrapper() -> None:
+    payload = {
+        "type": "agentsessionevent.created",
+        "data": {"agentSessionId": "sess_1"},
+        "raw_payload": {
+            "type": "AgentSessionEvent",
+            "action": "created",
+            "agentSession": {
+                "id": "sess_1",
+                "issue": {"title": "code review", "project": {"id": "proj_1"}},
+            },
+        },
+    }
+    raw = _unwrap_payload(payload)
+    assert _extract_session_id(raw) == "sess_1"
+    assert _extract_issue_title(raw) == "code review"
+    assert _extract_issue_project_id(raw) == "proj_1"
+
+
+def test_extracts_prompt_body_from_raw_payload_wrapper() -> None:
+    payload = {
+        "type": "agentsessionevent.prompted",
+        "data": {"agentSessionId": "sess_1"},
+        "raw_payload": {
+            "type": "AgentSessionEvent",
+            "action": "prompted",
+            "agentSession": {"id": "sess_1"},
+            "agentActivity": {"body": "please continue"},
+        },
+    }
+    raw = _unwrap_payload(payload)
+    assert _extract_session_id(raw) == "sess_1"
+    assert _extract_prompt_body(raw) == "please continue"
