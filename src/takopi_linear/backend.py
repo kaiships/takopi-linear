@@ -344,6 +344,43 @@ async def _maybe_fetch_prompt_from_linear(
     return _extract_activity_body(activity)
 
 
+def _extract_prompt_from_agent_session_snapshot(snapshot: object) -> str | None:
+    if not isinstance(snapshot, dict):
+        return None
+    activities = snapshot.get("activities")
+    if not isinstance(activities, dict):
+        return None
+    nodes = activities.get("nodes")
+    if not isinstance(nodes, list):
+        return None
+
+    best_body: str | None = None
+    best_created_at: str = ""
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        content = node.get("content")
+        typename = content.get("__typename") if isinstance(content, dict) else None
+        if typename not in {"AgentActivityPromptContent", "AgentActivityActionContent"}:
+            continue
+
+        body = _extract_activity_body(node)
+        if body is None:
+            continue
+
+        created_at = (
+            _coerce_text(node.get("createdAt"))
+            or _coerce_text(node.get("created_at"))
+            or ""
+        )
+        if best_body is None or created_at > best_created_at:
+            best_body = body
+            best_created_at = created_at
+
+    return best_body
+
+
 @dataclass(slots=True)
 class _SessionState:
     resume: ResumeToken | None = None
@@ -636,9 +673,20 @@ async def _handle_event(
 
         issue_id: str | None = None
         issue_from_api: dict[str, Any] | None = None
+        agent_session_snapshot: dict[str, Any] | None = None
 
         project_id = _extract_issue_project_id(payload)
         issue_title = _extract_issue_title(payload) or _extract_issue_title_from_prompt_context(payload)
+        prompt_from_payload = _extract_prompt_body(payload)
+
+        should_fetch_snapshot = False
+        if normalized == "agent_session.created" and (project_id is None or issue_title is None):
+            should_fetch_snapshot = True
+        if normalized == "agent_session.prompted":
+            if not prompt_from_payload and _extract_agent_activity_id(payload) is None:
+                should_fetch_snapshot = True
+            if state.context is None and project_id is None and project_map:
+                should_fetch_snapshot = True
 
         if normalized == "agent_session.created":
             issue_id = _extract_issue_id(payload)
@@ -653,18 +701,43 @@ async def _handle_event(
                 if isinstance(project, dict):
                     project_id = _coerce_text(project.get("id")) or project_id
 
+        if should_fetch_snapshot:
+            try:
+                agent_session_snapshot = await client.get_agent_session_snapshot(
+                    session_id,
+                    activities_last=20,
+                )
+            except LinearApiError:
+                agent_session_snapshot = None
+
+            if agent_session_snapshot is not None:
+                issue = agent_session_snapshot.get("issue")
+                if isinstance(issue, dict):
+                    issue_id = _coerce_text(issue.get("id")) or issue_id
+                    issue_title = _coerce_text(issue.get("title")) or issue_title
+                    project = issue.get("project")
+                    if isinstance(project, dict):
+                        project_id = _coerce_text(project.get("id")) or project_id
+
         if state.context is None and project_id and project_id in project_map:
             state.context = RunContext(project=project_map[project_id], branch=None)
 
-        if normalized == "agent_session.created":
-            if issue_title is None and issue_from_api is not None:
-                issue_title = _coerce_text(issue_from_api.get("title")) or issue_title
-            prompt = issue_title or _extract_prompt_body(payload)
-        else:
-            prompt = _extract_prompt_body(payload)
+        if normalized == "agent_session.created" and issue_title is None and issue_from_api is not None:
+            issue_title = _coerce_text(issue_from_api.get("title")) or issue_title
 
-        if not prompt:
-            prompt = await _maybe_fetch_prompt_from_linear(payload, client=client)
+        prompt_body = prompt_from_payload
+        if not prompt_body:
+            prompt_body = await _maybe_fetch_prompt_from_linear(payload, client=client)
+        if not prompt_body and agent_session_snapshot is not None:
+            prompt_body = _extract_prompt_from_agent_session_snapshot(agent_session_snapshot)
+
+        if normalized == "agent_session.created":
+            if issue_title and prompt_body and issue_title not in prompt_body:
+                prompt = f"{issue_title}\n\n{prompt_body}"
+            else:
+                prompt = prompt_body or issue_title
+        else:
+            prompt = prompt_body
 
         if not prompt:
             msg = (
